@@ -81,11 +81,15 @@ def web_search(
 
     if provider == "qnaigc":
         try:
-            payload: Dict[str, Any] = {"q": query, "num": limit}
+            payload: Dict[str, Any] = {
+                "query": query,
+                "max_results": limit,
+                "search_type": "web",
+            }
             if start_date and end_date:
                 payload["time_filter"] = f"{start_date.strftime('%Y-%m-%d')}..{end_date.strftime('%Y-%m-%d')}"
             resp = requests.post(
-                f"{endpoint}/search",
+                f"{endpoint}/search/web",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=30,

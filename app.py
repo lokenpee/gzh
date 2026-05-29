@@ -11,6 +11,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import time
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -232,6 +234,18 @@ def filter_dataframe(
     return df.loc[mask].copy()
 
 
+def filter_by_entities(df: pd.DataFrame, entities: List[str]) -> pd.DataFrame:
+    """初筛：正文content必须包含全部核心实体词（AND匹配）。"""
+    if not entities:
+        return df.copy()
+    mask = pd.Series(True, index=df.index)
+    for entity in entities:
+        mask &= df["content"].fillna("").astype(str).str.contains(
+            entity, case=False, regex=False, na=False
+        )
+    return df.loc[mask].copy()
+
+
 # ── Embedding 粗筛 + LLM 精筛 ──────────────────────────────
 
 def load_embedding_config() -> Dict[str, Any]:
@@ -407,7 +421,13 @@ def build_timeline_option(
     option: Dict[str, Any] = {
         "tooltip": {
             "trigger": "axis",
-            "formatter": "function(params){var p=params&&params[0];if(!p){return '';}return p.axisValue + '<br/>文章数：' + p.data;}",
+            "formatter": """
+function(params){
+  var p = params && params[0];
+  if (!p) { return ''; }
+  return p.axisValue + '<br/>' + '文章数：' + p.data;
+}
+""".strip(),
         },
         "xAxis": {
             "type": "category",
@@ -595,11 +615,6 @@ def recognize_intent(
         "  期货/外汇（如'离岸人民币''COMEX黄金'）。\n"
         "  基于检索内容推断事件对各类资产的影响方向，不限于字面提及的标的。\n"
         "  如无法确定具体个股，至少输出受影响的板块。如果确实无法识别则输出空数组。\n\n"
-        "- key_points: 最多5个关键时间节点，每个包含node_name和time(yyyy-MM-dd)。\n"
-        "  质量要求：每个节点必须与事件有【直接因果或时序关系】。\n"
-        "  如果某件事只是同期发生但与事件无关，不要收录。\n"
-        "  好的示例：'2025-04-02 美国宣布对华加征34%关税'（直接因果）\n"
-        "  坏的示例：'2025-03-27 某券商发布研报'（仅是评论，非事件节点）\n\n"
         "- confidence: 0-1之间的小数，表示对该事件理解的置信度\n\n"
         f"时间区间：{start_date.isoformat()} ~ {end_date.isoformat()}\n"
         f"用户原始关键词：{keyword}\n\n"
@@ -623,6 +638,79 @@ def recognize_intent(
         return None, f"JSON解析失败：{content[:300]}"
     except Exception as exc:
         return None, str(exc)
+
+
+def recognize_timeline(
+    event_name: str,
+    entities: List[str],
+    start_date: date,
+    end_date: date,
+    search_cfg: Dict[str, Any],
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> Tuple[List[Dict[str, str]], str]:
+    """第二阶段：联网搜索事件时间线，LLM提取关键时间节点。"""
+    if not api_key or not search_cfg.get("enabled"):
+        return [], "搜索未配置或无API Key"
+
+    timeline_query = f"{event_name} 关键时间节点 事件经过"
+    timeline_results, srch_status = search_client.web_search(
+        timeline_query, search_cfg, start_date, end_date,
+    )
+    if srch_status != "ok" or not timeline_results:
+        return [], f"时间线搜索失败：{srch_status}"
+
+    items: List[str] = []
+    for idx, item in enumerate(timeline_results, start=1):
+        items.append(
+            f"#{idx}\n标题：{item.get('title','')}\n摘要：{item.get('snippet','')}\n"
+            f"内容片段：{str(item.get('content',''))[:800]}"
+        )
+
+    prompt = (
+        "你是一名资深金融事件分析师。请根据联网检索结果，提取该事件的关键时间节点。\n\n"
+        "输出必须是合法JSON数组，不要添加Markdown代码块。格式：\n"
+        '[{"node_name": "节点描述", "time": "yyyy-MM-dd"}, ...]\n\n'
+        "要求：\n"
+        "- 最多5个关键时间节点，按时间顺序排列\n"
+        "- 每个节点必须与事件有【直接因果或时序关系】\n"
+        "- 如果某件事只是同期发生但与事件无关，不要收录\n"
+        "- 好的示例：'2025-04-02 美国宣布对华加征34%关税'（直接因果）\n"
+        "- 坏的示例：'2025-03-27 某券商发布研报'（仅是评论，非事件节点）\n"
+        "- node_name不超过30字，time格式必须为yyyy-MM-dd\n\n"
+        f"事件名称：{event_name}\n"
+        f"核心实体：{', '.join(entities)}\n"
+        f"时间区间：{start_date.isoformat()} ~ {end_date.isoformat()}\n\n"
+        f"联网检索结果（共{len(timeline_results)}条）：\n\n"
+        + "\n\n".join(items)
+    )
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        data = json.loads(content)
+        if not isinstance(data, list):
+            return [], f"LLM返回格式异常：{content[:300]}"
+        key_points: List[Dict[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            node_name = str(item.get("node_name") or item.get("label") or "").strip()
+            time_raw = item.get("time") or item.get("date") or ""
+            time_str = str(time_raw).strip()
+            if node_name and time_str:
+                key_points.append({"node_name": node_name, "time": time_str})
+        return key_points[:5], "ok"
+    except json.JSONDecodeError:
+        return [], f"JSON解析失败：{content[:300]}"
+    except Exception as exc:
+        return [], str(exc)
 
 
 def parse_key_points(payload: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -1054,25 +1142,79 @@ if not excel_files:
     st.warning("未找到 Excel 数据文件，请上传至项目根目录。")
     st.stop()
 
+# ── 侧边栏：搜索历史 ──
 with st.sidebar:
-    st.header("数据源")
-    file_names = [p.name for p in excel_files]
-    default_index = file_names.index(DEFAULT_EXCEL) if DEFAULT_EXCEL in file_names else 0
-    selected_file = st.selectbox("Excel 文件", file_names, index=default_index)
-    selected_path = root / selected_file
+    st.header("搜索历史")
+    history = st.session_state.setdefault("search_history", [])
 
-    xls = pd.ExcelFile(selected_path)
-    sheet_name = st.selectbox("Sheet", xls.sheet_names, index=0)
+    if not history:
+        st.caption("暂无搜索历史")
+    else:
+        for i, entry in enumerate(reversed(history)):
+            kw_display = entry["keyword"].replace("|", " + ")
+            with st.container():
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.markdown(f"**{html.escape(kw_display)}**")
+                    st.caption(
+                        f"{entry['start_date']} ~ {entry['end_date']}  "
+                        f"| {entry['result_count']} 篇  "
+                        f"| {entry['timestamp']}"
+                    )
+                with c2:
+                    if st.button("↩", key=f"hist_restore_{i}", help="恢复此搜索"):
+                        st.session_state["date_range"] = (
+                            pd.to_datetime(entry["start_date"]).date(),
+                            pd.to_datetime(entry["end_date"]).date(),
+                        )
+                        st.session_state["keyword_input"] = entry["keyword"]
+                        st.session_state["restore_from_history"] = True
+                        st.rerun()
 
-    st.header("大模型（观点提炼）")
-    base_url = st.text_input("Base URL", value="https://api.deepseek.com/v1")
-    model = st.text_input("Model", value="deepseek-chat")
-    api_key_env = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-    api_key = st.text_input(
-        "API Key（建议用环境变量 DEEPSEEK_API_KEY）",
-        value=api_key_env,
-        type="password",
-    )
+        if st.button("清空历史", key="clear_history"):
+            st.session_state["search_history"] = []
+            st.rerun()
+
+# ── 后台配置：全部从 local_settings.py / 环境变量读取 ──
+def _load_config():
+    config = {
+        "excel_file": "关税战海湖庄园协议_完整字段.xlsx",
+        "excel_sheet": None,
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+        "api_key": os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
+    }
+    try:
+        import local_settings as ls
+        if hasattr(ls, "EXCEL_FILE") and ls.EXCEL_FILE:
+            config["excel_file"] = ls.EXCEL_FILE
+        if hasattr(ls, "EXCEL_SHEET") and ls.EXCEL_SHEET:
+            config["excel_sheet"] = ls.EXCEL_SHEET
+        if hasattr(ls, "LLM_BASE_URL") and ls.LLM_BASE_URL:
+            config["base_url"] = ls.LLM_BASE_URL
+        if hasattr(ls, "LLM_MODEL") and ls.LLM_MODEL:
+            config["model"] = ls.LLM_MODEL
+        for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"):
+            if hasattr(ls, key) and getattr(ls, key):
+                config["api_key"] = getattr(ls, key)
+                break
+    except ImportError:
+        pass
+    return config
+
+cfg = _load_config()
+
+# 确定数据文件
+file_names = [p.name for p in excel_files]
+if cfg["excel_file"] in file_names:
+    selected_file = cfg["excel_file"]
+else:
+    selected_file = file_names[0] if file_names else DEFAULT_EXCEL
+selected_path = root / selected_file
+sheet_name = cfg["excel_sheet"]
+base_url = cfg["base_url"]
+model = cfg["model"]
+api_key = cfg["api_key"]
 
 raw_df = load_excel(str(selected_path), sheet_name)
 df = prepare_dataframe(raw_df)
@@ -1087,48 +1229,83 @@ else:
 
 top_left, top_right = st.columns([1, 1])
 with top_left:
+    default_dates = (min_date, max_date)
+    if st.session_state.pop("restore_from_history", None):
+        default_dates = st.session_state.get("date_range", default_dates)
     date_range = st.date_input(
         "时间区间",
-        value=(min_date, max_date),
+        value=default_dates,
         min_value=min_date,
         max_value=max_date,
-        key=f"date_range|{selected_file}|{sheet_name}",
+        key="date_range",
     )
 with top_right:
+    default_kw = st.session_state.get("keyword_input", "")
     keyword = st.text_input(
         "事件关键词",
-        value="",
-        key=f"keyword|{selected_file}|{sheet_name}",
+        value=default_kw,
+        key="keyword_input",
     )
 
-is_default_mode = False
-if not keyword.strip() and default_exists:
-    is_default_mode = True
-    keyword = DEFAULT_KEYWORD
-    st.caption(f"默认模式：关键词 {DEFAULT_KEYWORD.replace('|', ' + ')}，数据源 {DEFAULT_EXCEL}")
+# ── 开始复盘按钮 ──
+restore_from_hist = st.session_state.get("restore_from_history", False)
+search_triggered = st.session_state.get("search_triggered", False)
+
+if not search_triggered and not restore_from_hist:
+    _, btn_col, _ = st.columns([1, 2, 1])
+    with btn_col:
+        if st.button("开始复盘", type="primary", use_container_width=True):
+            st.session_state["search_triggered"] = True
+            st.rerun()
+    st.info("请输入事件关键词和时间区间，点击「开始复盘」进行分析。")
+    st.stop()
+
+st.session_state["search_triggered"] = True
+st.session_state.pop("restore_from_history", None)
 
 start_date, end_date = date_range
 if start_date > end_date:
     st.error("时间区间不合法：开始日期不能晚于结束日期。")
     st.stop()
 
+# ── 默认模式（关键词为空时使用预设关键词）──
+is_default_mode = False
+if not keyword.strip() and default_exists:
+    is_default_mode = True
+    keyword = DEFAULT_KEYWORD
+    st.caption(f"关键词 {DEFAULT_KEYWORD.replace('|', ' + ')}")
+
 # ── 联网搜索 → LLM意图识别 → 置信度过滤 → 核心实体（两种模式都走）──
 intent_result: Optional[Dict[str, Any]] = None
-if api_key:
+event_key_points: List[Dict[str, str]] = []
+if not api_key:
+    st.warning("未配置 LLM API Key，跳过联网搜索与意图识别。请在 local_settings.py 中设置 DEEPSEEK_API_KEY。")
+else:
     srch_cfg = search_client.load_search_config()
-    if srch_cfg.get("enabled"):
+    if not srch_cfg.get("enabled"):
+        st.warning("未配置搜索服务，跳过联网搜索。请在 local_settings.py 中设置 SEARCH_PROVIDER 和 SEARCH_API_KEY。")
+    else:
         search_query = keyword.replace("|", " ")
         with st.spinner(f"正在联网搜索「{search_query}」..."):
             search_results, srch_status = search_client.web_search(
                 search_query, srch_cfg, start_date, end_date,
             )
-        if srch_status == "ok" and search_results:
-            with st.spinner("正在进行LLM意图识别..."):
+        if srch_status != "ok":
+            st.warning(f"联网搜索失败：{srch_status}")
+        elif not search_results:
+            st.warning(f"联网搜索「{search_query}」未返回结果，请尝试调整关键词或时间区间。")
+        else:
+            st.caption(f"联网搜索返回 {len(search_results)} 条结果")
+            with st.spinner("正在进行LLM意图识别（事件理解）..."):
                 intent_result, intent_status = recognize_intent(
                     api_key, base_url, model, search_query, search_results,
                     start_date, end_date,
                 )
-            if intent_status == "ok" and intent_result:
+            if intent_status != "ok":
+                st.warning(f"LLM意图识别失败：{intent_status}")
+            elif not intent_result:
+                st.warning("LLM意图识别未返回有效结果。")
+            else:
                 # 置信度过滤核心实体
                 raw_entities = intent_result.get("event_entities", [])
                 if isinstance(raw_entities, list) and raw_entities:
@@ -1142,6 +1319,22 @@ if api_key:
                 # 存入 session_state 供后续展示
                 st.session_state["intent_result"] = intent_result
 
+                # ── 第二阶段：时间线搜索 → LLM提取关键节点 ──
+                event_name = intent_result.get("event_name", "")
+                final_entities = intent_result.get("event_entities", [])
+                if event_name:
+                    with st.spinner(f"正在联网搜索「{event_name}」关键时间节点..."):
+                        event_key_points, tl_status = recognize_timeline(
+                            event_name, final_entities,
+                            start_date, end_date,
+                            srch_cfg, api_key, base_url, model,
+                        )
+                    if tl_status != "ok":
+                        st.warning(f"时间线搜索失败：{tl_status}")
+                    elif event_key_points:
+                        intent_result["key_points"] = event_key_points
+                        st.session_state["intent_result"] = intent_result
+
 # ── 数据获取：默认模式用Excel，非默认模式查DB ──
 db_used = False
 if is_default_mode:
@@ -1152,7 +1345,6 @@ else:
     db_cfg = db_client.load_db_config()
     if not db_cfg.get("enabled"):
         st.error("非默认模式需要配置公司数据库。请在 local_settings.py 中填写 DB_HOST、DB_USER、DB_PASSWORD、DB_SERVICE_NAME。")
-        st.info("提示：如需演示，请清空关键词使用默认模式。")
         st.stop()
     if not entities:
         st.error("未能识别出有效核心实体，无法查询数据库。")
@@ -1207,7 +1399,7 @@ with st.expander("事件关键节点（可选，可编辑）", expanded=False):
         "每行一个：YYYY-MM-DD | 节点名称",
         value=default_event_text,
         height=120,
-        key=f"event_nodes|{selected_file}|{sheet_name}",
+        key="event_nodes",
     )
 
 filter_signature = hashlib.sha1(
@@ -1221,9 +1413,29 @@ if st.session_state.get("filter_signature") != filter_signature:
     st.session_state["viewpoint_display_key"] = None
 
 event_nodes = parse_event_nodes(event_text)
-filtered = filter_dataframe(df, start_date, end_date, keyword)
 
-# Embedding 粗筛 + LLM 精筛（默认/非默认模式都走）
+# ── 初筛：日期范围 + 状态过滤 ──
+filtered = filter_dataframe(df, start_date, end_date, "")
+
+# ── 核心实体 AND 匹配（正文content必须包含全部核心实体词）──
+intent_entities: List[str] = []
+if st.session_state.get("intent_result"):
+    raw_ents = st.session_state["intent_result"].get("event_entities", [])
+    if isinstance(raw_ents, list) and raw_ents:
+        intent_entities = [str(e).strip() for e in raw_ents if str(e).strip()]
+
+if not intent_entities:
+    # 降级：使用关键词拆分作为实体词
+    intent_entities = [k.strip() for k in keyword.split("|") if k.strip()]
+
+if intent_entities and not filtered.empty:
+    before_entity_filter = len(filtered)
+    filtered = filter_by_entities(filtered, intent_entities)
+    dropped = before_entity_filter - len(filtered)
+    if dropped > 0:
+        st.caption(f"实体AND初筛：{before_entity_filter} → {len(filtered)} 篇（要求正文包含：{', '.join(intent_entities)}）")
+
+# ── Embedding 粗筛 + LLM 精筛（默认/非默认模式都走）──
 if not filtered.empty and api_key:
     keyword_for_filter = keyword.replace("|", " ")
     embed_cfg = load_embedding_config()
@@ -1237,6 +1449,26 @@ if not filtered.empty and api_key:
             filtered, llm_meta = llm_fine_filter(filtered, keyword_for_filter, api_key, base_url, model)
         if llm_meta.get("enabled"):
             st.caption(f"LLM 精筛：{llm_meta['input']} → {llm_meta['output']} 篇")
+
+# ── 保存搜索历史 ──
+now = time.time()
+last_save = st.session_state.get("_last_history_save", 0)
+if now - last_save > 2 and keyword.strip():  # 2秒防抖，避免逐字输入时重复保存
+    history = st.session_state.get("search_history", [])
+    new_entry = {
+        "keyword": keyword,
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "result_count": len(filtered) if not filtered.empty else 0,
+        "timestamp": datetime.now().strftime("%m-%d %H:%M"),
+        "filter_signature": filter_signature,
+    }
+    if not history or history[-1].get("filter_signature") != filter_signature:
+        history.append(new_entry)
+        if len(history) > 20:
+            history = history[-20:]
+        st.session_state["search_history"] = history
+    st.session_state["_last_history_save"] = now
 
 if filtered.empty:
     st.info("当前筛选条件下没有命中文章。")
@@ -1316,7 +1548,7 @@ else:
     generate = st.button("生成观点总结（调用大模型）")
     if generate:
         if not api_key:
-            st.error("缺少 API Key：请设置环境变量 DEEPSEEK_API_KEY，或在侧边栏粘贴。")
+            st.error("缺少 API Key：请设置环境变量 DEEPSEEK_API_KEY，或在 local_settings.py 中配置。")
         else:
             with st.spinner("正在调用大模型生成观点总结..."):
                 result, status = call_deepseek(api_key, base_url, model, rows)
@@ -1355,39 +1587,53 @@ else:
             st.session_state["wall_limit"] = min(wall_limit + 20, len(wall))
 
 st.subheader("关联标的走势")
-if "scode_list" not in filtered.columns or filtered["scode_list"].dropna().empty:
-    st.info("未识别到关联标的（scode_list 为空）。")
-else:
+
+# 优先使用LLM意图识别输出的Industry_asset，降级使用数据的scode_list
+industry_assets: List[str] = []
+ir = st.session_state.get("intent_result")
+if ir:
+    raw_assets = ir.get("Industry_asset", [])
+    if isinstance(raw_assets, list) and raw_assets:
+        industry_assets = [str(a).strip() for a in raw_assets if str(a).strip()]
+
+if industry_assets:
+    # 使用LLM识别的关联标的（板块/个股/大宗商品/期货等）
+    labels = industry_assets
+    codes = industry_assets  # mock_ohlc 接受任意字符串作为种子
+elif "scode_list" in filtered.columns and not filtered["scode_list"].dropna().empty:
+    # 降级：使用数据中的股票代码
     codes = top_stock_codes(filtered["scode_list"], top_k=5)
     if not codes:
-        st.info("未识别到关联标的（scode_list 为空）。")
+        st.info("未识别到关联标的。")
+        st.stop()
+    name_map = {}
+    if "sname_list" in filtered.columns and filtered["sname_list"].dropna().any():
+        name_map = parse_stock_name_map(filtered["sname_list"])
+    labels = []
+    used: Counter[str] = Counter()
+    for code in codes:
+        base = stock_label(code, name_map)
+        used[base] += 1
+        labels.append(base if used[base] == 1 else f"{base}（{code}）")
+else:
+    st.info("未识别到关联标的。")
+    st.stop()
+
+if len(codes) == 1:
+    dates, ohlc = mock_ohlc(codes[0], start_date, end_date)
+    if not dates:
+        st.info("当前区间没有可用的交易日数据。")
     else:
-        name_map = {}
-        if "sname_list" in filtered.columns and filtered["sname_list"].dropna().any():
-            name_map = parse_stock_name_map(filtered["sname_list"])
-
-        labels: List[str] = []
-        used: Counter[str] = Counter()
-        for code in codes:
-            base = stock_label(code, name_map)
-            used[base] += 1
-            labels.append(base if used[base] == 1 else f"{base}（{code}）")
-
-        if len(codes) == 1:
-            dates, ohlc = mock_ohlc(codes[0], start_date, end_date)
+        kline_option = build_kline_option(dates, ohlc, event_nodes)
+        st_echarts(kline_option, height="350px", key="kline_single")
+else:
+    tabs = st.tabs(labels)
+    for tab, code in zip(tabs, codes):
+        with tab:
+            dates, ohlc = mock_ohlc(code, start_date, end_date)
             if not dates:
                 st.info("当前区间没有可用的交易日数据。")
             else:
                 kline_option = build_kline_option(dates, ohlc, event_nodes)
-                st_echarts(kline_option, height="350px", key="kline_single")
-        else:
-            tabs = st.tabs(labels)
-            for tab, code in zip(tabs, codes):
-                with tab:
-                    dates, ohlc = mock_ohlc(code, start_date, end_date)
-                    if not dates:
-                        st.info("当前区间没有可用的交易日数据。")
-                    else:
-                        kline_option = build_kline_option(dates, ohlc, event_nodes)
-                        key = hashlib.sha1(f"{filter_signature}|{code}".encode("utf-8")).hexdigest()[:12]
-                        st_echarts(kline_option, height="350px", key=f"kline_{key}")
+                key = hashlib.sha1(f"{filter_signature}|{code}".encode("utf-8")).hexdigest()[:12]
+                st_echarts(kline_option, height="350px", key=f"kline_{key}")

@@ -1,7 +1,7 @@
 # Local runtime settings for demo use. Do not commit this file.
 
 DEEPSEEK_API_KEY = "sk-38bc7be5a60e4298a80098e76829efdb"
-OPENAI_API_KEY = ""
+OPENAI_API_KEY = "" 
 LLM_API_KEY = ""
 LLM_BASE_URL = "https://api.deepseek.com/v1"
 LLM_MODEL = "deepseek-v4-flash"
@@ -12,8 +12,8 @@ SEARCH_ENDPOINT = "https://api.qnaigc.com/v1"
 SEARCH_LIMIT = 10
 
 DEFAULT_EVENT_KEYWORD = ""
-EXCEL_FILE = ""
-EXCEL_SHEET = ""
+EXCEL_FILE = "关税战海湖庄园协议_完整字段.xlsx"
+EXCEL_SHEET = ""  # 留空则默认使用第一个Sheet
 IMAGE_BASE_URL = ""
 
 # 数据库配置（公司数据库）
