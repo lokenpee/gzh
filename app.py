@@ -16,6 +16,9 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+import db_client
+import search_client
+
 
 def ensure_running_in_streamlit() -> None:
     """避免误用 `python app.py` 直接运行导致组件初始化报错。
@@ -217,13 +220,179 @@ def filter_dataframe(
         mask &= status >= 0
 
     if kw:
-        match = safe_contains(df["title"], kw)
-        match |= safe_contains(df["keywords"], kw)
-        match |= safe_contains(df["keyword"], kw)
-        match |= safe_contains(df["content"], kw)
-        mask &= match
+        # 支持 | 分隔的多关键词 AND 匹配：每个关键词必须在至少一个字段中出现
+        keywords = [k.strip() for k in kw.split("|") if k.strip()]
+        for k in keywords:
+            kw_match = safe_contains(df["title"], k)
+            kw_match |= safe_contains(df["keywords"], k)
+            kw_match |= safe_contains(df["keyword"], k)
+            kw_match |= safe_contains(df["content"], k)
+            mask &= kw_match
 
     return df.loc[mask].copy()
+
+
+# ── Embedding 粗筛 + LLM 精筛 ──────────────────────────────
+
+def load_embedding_config() -> Dict[str, Any]:
+    config: Dict[str, Any] = {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Qwen/Qwen3-VL-Embedding-8B",
+        "api_key": "",
+        "batch_size": 32,
+        "timeout": 30,
+    }
+    try:
+        import local_settings
+        for key in ("EMBEDDING_BASE_URL", "EMBEDDING_MODEL", "EMBEDDING_API_KEY",
+                     "EMBEDDING_BATCH_SIZE", "EMBEDDING_TIMEOUT"):
+            if hasattr(local_settings, key):
+                val = getattr(local_settings, key)
+                if val is not None and val != "":
+                    config[key.lower().replace("embedding_", "")] = val
+    except ImportError:
+        pass
+    return config
+
+
+def _build_article_text(row: pd.Series) -> str:
+    title = str(row.get("title", "") or "")
+    summary = str(row.get("summary", "") or "")
+    keysentence = str(row.get("keysentence", "") or "")
+    content = str(row.get("content", "") or "")[:500]
+    return f"{title} {keysentence} {summary} {content}".strip()
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    import numpy as np
+    a_arr = np.array(a)
+    b_arr = np.array(b)
+    dot = np.dot(a_arr, b_arr)
+    norm_a = np.linalg.norm(a_arr)
+    norm_b = np.linalg.norm(b_arr)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(dot / (norm_a * norm_b))
+
+
+def _call_embedding_api(texts: List[str], config: Dict[str, Any]) -> Optional[List[List[float]]]:
+    client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+    try:
+        response = client.embeddings.create(
+            model=config["model"],
+            input=texts,
+        )
+    except Exception as exc:
+        st.warning(f"Embedding API 调用失败：{exc}")
+        return None
+    return [d.embedding for d in response.data]
+
+
+def embedding_coarse_filter(
+    df: pd.DataFrame,
+    keyword: str,
+    config: Dict[str, Any],
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"enabled": False, "input": len(df), "output": len(df)}
+    if not config.get("api_key") or len(df) <= 1:
+        return df, meta
+
+    texts = [_build_article_text(row) for _, row in df.iterrows()]
+    query_text = keyword.replace("|", " ")
+
+    all_texts = [query_text] + texts
+    batch_size = int(config.get("batch_size", 32))
+    all_embeddings: List[List[float]] = []
+
+    for i in range(0, len(all_texts), batch_size):
+        batch = all_texts[i:i + batch_size]
+        batch_embs = _call_embedding_api(batch, config)
+        if batch_embs is None:
+            return df, meta
+        all_embeddings.extend(batch_embs)
+
+    query_emb = all_embeddings[0]
+    article_embs = all_embeddings[1:]
+
+    scores = [_cosine_similarity(query_emb, emb) for emb in article_embs]
+    df = df.copy()
+    df["_embed_score"] = scores
+
+    THRESHOLD = 0.35
+    filtered = df[df["_embed_score"] >= THRESHOLD].copy()
+    filtered = filtered.drop(columns=["_embed_score"])
+
+    meta["enabled"] = True
+    meta["output"] = len(filtered)
+    meta["threshold"] = THRESHOLD
+    meta["dropped"] = len(df) - len(filtered)
+    return filtered, meta
+
+
+def llm_fine_filter(
+    df: pd.DataFrame,
+    keyword: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"enabled": False, "input": len(df), "output": len(df)}
+    if not api_key or len(df) == 0:
+        return df, meta
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    keep_indices: List[int] = []
+
+    BATCH_SIZE = 5
+    rows = df.to_dict(orient="records")
+
+    for batch_start in range(0, len(rows), BATCH_SIZE):
+        batch = rows[batch_start:batch_start + BATCH_SIZE]
+        lines = [
+            f"判断以下文章是否确实与事件「{keyword}」相关，而非只是恰好包含关键词。",
+            "对每篇文章输出JSON：{\"idx\":序号,\"relevant\":true/false}",
+            "",
+        ]
+        for i, row in enumerate(batch):
+            title = str(row.get("title", ""))[:200]
+            summary = str(row.get("summary", ""))[:300]
+            content = str(row.get("content", ""))[:500]
+            lines.append(f"--- 文章{i+1} ---")
+            lines.append(f"标题：{title}")
+            lines.append(f"摘要：{summary}")
+            lines.append(f"正文片段：{content}")
+        lines.append("")
+        lines.append("输出JSON数组：")
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "\n".join(lines)}],
+                temperature=0.1,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            results = json.loads(content)
+            for item in results:
+                idx = int(item.get("idx", 0)) - 1
+                if item.get("relevant", False):
+                    keep_indices.append(batch_start + idx)
+        except Exception:
+            # 如果LLM调用失败，保守保留该批次所有文章
+            for i in range(len(batch)):
+                keep_indices.append(batch_start + i)
+
+    if keep_indices:
+        filtered = df.iloc[keep_indices].copy()
+    else:
+        filtered = df.head(0).copy()
+
+    meta["enabled"] = True
+    meta["output"] = len(filtered)
+    meta["dropped"] = len(df) - len(filtered)
+    return filtered, meta
+
+
+# ────────────────────────────────────────────────────────────
 
 
 def build_timeline_option(
@@ -314,32 +483,41 @@ def extract_clicked_date(payload: Any) -> Optional[str]:
 
 def build_llm_prompt(rows: List[Dict[str, Any]]) -> str:
     parts = [
-        "你是一位金融资讯分析师。请对以下阅读量最高的10篇文章进行观点提炼。",
+        "你是一位金融资讯分析师。请对以下阅读量最高的10篇文章进行观点聚类分析。",
         "",
         "输入格式（每篇文章）：",
         "- 标题：{TITLE}",
         "- 来源：{SOURCE}",
         "- 阅读量：{READ_COUNT}",
+        "- 发布时间：{DTIME}",
         "- 关键句：{KEYSENTENCE}",
         "- 摘要：{SUMMARY}",
         "- 正文前2000字：{CONTENT}",
         "",
         "要求：",
-        "1. 每篇文章提炼一个核心观点，不超过30字。",
-        "2. 观点必须基于文章明确表达的判断，严禁编造。",
-        "3. 如果文章只是新闻报道、没有明确观点，标注为\"事件报道，无明显观点\"。",
-        "4. 输出格式为JSON数组，每项包含：title（标题）、source（来源）、read_count（阅读量）、viewpoint（观点，≤30字）、url（链接）。",
+        "1. 将文章中相似的观点聚合成2-4个观点类型，每个类型代表一种不同的分析角度或立场。",
+        "2. 同一聚类下的文章应表达相同或相近的核心判断。",
+        "3. 如果某篇文章只是新闻报道、没有明确观点，可不纳入任何聚类。",
+        "4. 每篇文章可以归属到多个聚类（如果其表达了多种观点）。",
+        "5. cluster_name不超过20字，core_viewpoint不超过50字，detail不超过200字。",
+        "6. 输出格式为JSON数组，每项包含：",
+        "   - cluster_name: 观点类型名称",
+        "   - core_viewpoint: 核心观点，精炼概括该聚类所有文章的共同判断",
+        "   - detail: 观点详情，包括数据逻辑推演、论据支撑等（有就写，没有则留空）",
+        "   - sources: 来源文章数组，每项含 title, source, time, read_count, url",
         "",
         "输出：",
-        "[{\"title\":\"...\",\"source\":\"...\",\"read_count\":12345,\"viewpoint\":\"...\",\"url\":\"...\"}, ...]",
+        '[{"cluster_name":"...","core_viewpoint":"...","detail":"...","sources":[{"title":"...","source":"...","time":"...","read_count":0,"url":"..."}]}]',
         "",
     ]
     for row in rows:
         content = str(row.get("content", ""))[:2000]
+        time_str = str(row.get("dtime", "") or "")
         parts.append("---")
         parts.append(f"标题：{row.get('title','')}")
         parts.append(f"来源：{row.get('source','')}")
         parts.append(f"阅读量：{row.get('read_count','')}")
+        parts.append(f"发布时间：{time_str}")
         parts.append(f"关键句：{row.get('keysentence','')}")
         parts.append(f"摘要：{row.get('summary','')}")
         parts.append(f"正文前2000字：{content}")
@@ -379,6 +557,88 @@ def call_deepseek(
         return None, content
     cache[cache_key] = data
     return data, "ok"
+
+
+def recognize_intent(
+    api_key: str,
+    base_url: str,
+    model: str,
+    keyword: str,
+    search_results: List[Dict[str, str]],
+    start_date: date,
+    end_date: date,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    if not api_key or not search_results:
+        return None, "无搜索内容或API Key"
+
+    items: List[str] = []
+    for idx, item in enumerate(search_results, start=1):
+        items.append(
+            f"#{idx}\n标题：{item.get('title','')}\n摘要：{item.get('snippet','')}\n"
+            f"内容片段：{str(item.get('content',''))[:500]}"
+        )
+
+    prompt = (
+        "你是一名资深金融事件分析师。请根据联网检索结果，结合你的金融领域知识，深度理解该事件。\n\n"
+        "输出必须是合法JSON对象，不要添加Markdown代码块。\n\n"
+        "字段要求：\n\n"
+        "- event_name: 规范化事件名。格式：核心主体 + 关键动作 + 对市场/行业的影响。不超过30字。\n"
+        "  好的示例：'海湖庄园协议签署引发中美关税升级与全球供应链震荡'\n"
+        "  坏的示例：'海湖庄园协议引发全球热议'（太泛，没有具体影响）\n\n"
+        "- event_entities: 1-3个实体词，将用于数据库全文检索（AND匹配）筛选文章。\n"
+        "  核心判据：每个实体必须是在【所有】讨论该事件的文章中都必然出现的关键词。\n"
+        "  - 如果某个词只在部分文章中出现（如具体人名、细节术语），不要输出。\n"
+        "  - 如果1个词（如'韬定律'）已经足够唯一地锁定该事件，就只输出1个。\n"
+        "  - 如果1个词过于宽泛（如'GPT'会命中大量无关文章），则需加上限定词（如'GPT'+'6.0'）。\n\n"
+        "- Industry_asset: 事件关联的可交易标的，必须是能在金融终端检索到的品种。\n"
+        "  可选类型：A股板块（如'半导体''稀土永磁'）、个股（如'中芯国际'）、大宗商品（如'沪铜''原油'）、\n"
+        "  期货/外汇（如'离岸人民币''COMEX黄金'）。\n"
+        "  基于检索内容推断事件对各类资产的影响方向，不限于字面提及的标的。\n"
+        "  如无法确定具体个股，至少输出受影响的板块。如果确实无法识别则输出空数组。\n\n"
+        "- key_points: 最多5个关键时间节点，每个包含node_name和time(yyyy-MM-dd)。\n"
+        "  质量要求：每个节点必须与事件有【直接因果或时序关系】。\n"
+        "  如果某件事只是同期发生但与事件无关，不要收录。\n"
+        "  好的示例：'2025-04-02 美国宣布对华加征34%关税'（直接因果）\n"
+        "  坏的示例：'2025-03-27 某券商发布研报'（仅是评论，非事件节点）\n\n"
+        "- confidence: 0-1之间的小数，表示对该事件理解的置信度\n\n"
+        f"时间区间：{start_date.isoformat()} ~ {end_date.isoformat()}\n"
+        f"用户原始关键词：{keyword}\n\n"
+        f"联网检索结果（共{len(search_results)}条）：\n\n"
+        + "\n\n".join(items)
+    )
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            return None, f"LLM返回格式异常：{content[:300]}"
+        return payload, "ok"
+    except json.JSONDecodeError:
+        return None, f"JSON解析失败：{content[:300]}"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def parse_key_points(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    items = payload.get("key_points", [])
+    if not isinstance(items, list):
+        return []
+    key_points: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        node_name = str(item.get("node_name") or item.get("label") or "").strip()
+        time_raw = item.get("time") or item.get("date") or ""
+        time_str = str(time_raw).strip()
+        if node_name and time_str:
+            key_points.append({"node_name": node_name, "time": time_str})
+    return key_points[:5]
 
 
 def pick_summary(row: pd.Series) -> str:
@@ -537,19 +797,6 @@ function(params){
                 },
             }
         ],
-        "graphic": [
-            {
-                "type": "text",
-                "left": "center",
-                "top": "middle",
-                "style": {
-                    "text": "行情数据为模拟数据，正式上线后对接同花顺/Wind API",
-                    "fill": "rgba(0,0,0,0.15)",
-                    "fontSize": 14,
-                    "fontWeight": 600,
-                },
-            }
-        ],
     }
     return option
 
@@ -643,6 +890,7 @@ def render_daily_hot_list(day_df: pd.DataFrame, selected_day: date) -> str:
         rank_color = "#d4a855" if rank <= 3 else "#9ca3af"
         title = html.escape(str(row.get("title", "") or ""))
         source = html.escape(str(row.get("source", "") or ""))
+        author = html.escape(str(row.get("author", "") or ""))
         read_count = format_read_count(row.get("read_count", 0))
         time_str = format_time_hhmm(row.get("dtime"))
         url = str(row.get("url", "") or "").strip()
@@ -652,13 +900,18 @@ def render_daily_hot_list(day_df: pd.DataFrame, selected_day: date) -> str:
         else:
             title_html = f'<span class="daily-title">{title}</span>'
 
+        meta_parts = [source]
+        if author:
+            meta_parts.append(author)
+        meta_str = " · ".join(meta_parts)
+
         rows_html.append(
             """
 <div class="daily-row">
   <div class="daily-rank" style="color:{rank_color};">{rank}</div>
   <div class="daily-main">
     {title_html}
-    <div class="daily-source">{source}</div>
+    <div class="daily-source">{meta_str}</div>
   </div>
   <div class="daily-right">
     <div class="daily-read">{read_count}</div>
@@ -669,7 +922,7 @@ def render_daily_hot_list(day_df: pd.DataFrame, selected_day: date) -> str:
                 rank=rank,
                 rank_color=rank_color,
                 title_html=title_html,
-                source=source,
+                meta_str=html.escape(meta_str),
                 read_count=read_count,
                 time_str=html.escape(time_str),
             )
@@ -683,50 +936,65 @@ def render_daily_hot_list(day_df: pd.DataFrame, selected_day: date) -> str:
     )
 
 
-def render_viewpoint_list(items: List[Dict[str, Any]]) -> str:
+def render_viewpoint_clusters(clusters: List[Dict[str, Any]]) -> str:
     rows_html: List[str] = []
-    for idx, item in enumerate(items):
-        rank = idx + 1
-        rank_color = "#d4a855" if rank <= 3 else "#9ca3af"
-        title = html.escape(str(item.get("title", "") or ""))
-        source = html.escape(str(item.get("source", "") or ""))
-        read_count = format_read_count(item.get("read_count", 0))
-        viewpoint = html.escape(str(item.get("viewpoint", "") or ""))
-        url = str(item.get("url", "") or "").strip()
-        if url:
-            url_attr = html.escape(url, quote=True)
-            title_html = f'<a class="vp-title" href="{url_attr}" target="_blank" rel="noopener noreferrer">{title}</a>'
-            link_html = f'<a href="{url_attr}" target="_blank" rel="noopener noreferrer">阅读原文</a>'
-        else:
-            title_html = f'<span class="vp-title">{title}</span>'
-            link_html = ""
+    for idx, cluster in enumerate(clusters):
+        cluster_name = html.escape(str(cluster.get("cluster_name", "") or ""))
+        core_viewpoint = html.escape(str(cluster.get("core_viewpoint", "") or ""))
+        detail = html.escape(str(cluster.get("detail", "") or ""))
+        sources = cluster.get("sources", [])
+        if not isinstance(sources, list):
+            sources = []
+
+        source_items: List[str] = []
+        for src in sources:
+            src_title = html.escape(str(src.get("title", "") or ""))
+            src_source = html.escape(str(src.get("source", "") or ""))
+            src_time = html.escape(str(src.get("time", "") or ""))
+            src_read = format_read_count(src.get("read_count", 0))
+            src_url = str(src.get("url", "") or "").strip()
+            if src_url:
+                src_url_attr = html.escape(src_url, quote=True)
+                src_link = f'<a href="{src_url_attr}" target="_blank" rel="noopener noreferrer" style="color:#3b82f6;text-decoration:none;">{src_title}</a>'
+            else:
+                src_link = src_title
+            source_items.append(
+                f'<div style="font-size:12px;color:#6b7280;margin-top:2px;">'
+                f'{src_link} — {src_source} · {src_time} · 阅读{src_read}'
+                f'</div>'
+            )
+
+        sources_html = "".join(source_items)
 
         rows_html.append(
             """
-<div class="vp-row">
-  <div class="vp-rank" style="color:{rank_color};">{rank}</div>
-  <div class="vp-body">
-    {title_html}
-    <div class="vp-meta">{source} · 阅读 {read_count}</div>
-    <div class="vp-text">{viewpoint}</div>
+<div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-bottom:12px;">
+  <div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:8px;">
+    <span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:#3b82f6;color:#fff;font-size:13px;font-weight:700;flex-shrink:0;">{idx}</span>
+    <div>
+      <div style="font-weight:700;color:#111827;font-size:15px;">{cluster_name}</div>
+      <div style="font-size:14px;color:#1d4ed8;margin-top:4px;line-height:1.5;">{core_viewpoint}</div>
+    </div>
   </div>
-  <div class="vp-link">{link_html}</div>
+  {detail_html}
+  <div style="margin-top:10px;border-top:1px solid #f3f4f6;padding-top:8px;">
+    <div style="font-size:12px;color:#9ca3af;margin-bottom:4px;">来源文章：</div>
+    {sources_html}
+  </div>
 </div>
 """.format(
-                rank=rank,
-                rank_color=rank_color,
-                title_html=title_html,
-                source=source,
-                read_count=read_count,
-                viewpoint=viewpoint,
-                link_html=link_html,
+                idx=idx + 1,
+                cluster_name=cluster_name,
+                core_viewpoint=core_viewpoint,
+                detail_html=f'<div style="font-size:13px;color:#374151;margin-top:6px;line-height:1.6;">{detail}</div>' if detail else "",
+                sources_html=sources_html,
             )
         )
 
     return (
         '<div class="hr-card">'
-        '<div class="hr-card-title">区间热点观点（阅读量Top10）</div>'
-        f'<div class="vp-list">{"".join(rows_html)}</div>'
+        '<div class="hr-card-title">区间热点观点聚类（阅读量Top10）</div>'
+        f'<div style="max-height:600px;overflow-y:auto;border-top:1px solid #f3f4f6;padding-top:8px;">{"".join(rows_html)}</div>'
         '</div>'
     )
 
@@ -769,22 +1037,28 @@ def render_wall_card(row: pd.Series) -> str:
     return inner
 
 
-st.set_page_config(page_title="热点复盘 Demo", layout="wide")
+st.set_page_config(page_title="热点复盘", layout="wide")
 
 root = Path.cwd()
 excel_files = find_excel_files(root)
 
-st.title("热点复盘功能重构 Demo")
+DEFAULT_EXCEL = "关税战海湖庄园协议_完整字段.xlsx"
+DEFAULT_KEYWORD = "关税战|海湖庄园协议"
+default_path = root / DEFAULT_EXCEL
+default_exists = default_path.exists()
+
+st.title("热点复盘")
 inject_css()
 
 if not excel_files:
-    st.warning("未在项目根目录找到 Excel（.xlsx）文件。请把模拟数据放到当前目录。")
+    st.warning("未找到 Excel 数据文件，请上传至项目根目录。")
     st.stop()
 
 with st.sidebar:
-    st.header("数据源（Demo）")
+    st.header("数据源")
     file_names = [p.name for p in excel_files]
-    selected_file = st.selectbox("Excel 文件", file_names, index=0)
+    default_index = file_names.index(DEFAULT_EXCEL) if DEFAULT_EXCEL in file_names else 0
+    selected_file = st.selectbox("Excel 文件", file_names, index=default_index)
     selected_path = root / selected_file
 
     xls = pd.ExcelFile(selected_path)
@@ -827,18 +1101,114 @@ with top_right:
         key=f"keyword|{selected_file}|{sheet_name}",
     )
 
-with st.expander("事件关键节点（可选）", expanded=False):
-    event_text = st.text_area(
-        "每行一个：YYYY-MM-DD | 节点名称",
-        value="",
-        height=120,
-        key=f"event_nodes|{selected_file}|{sheet_name}",
-    )
+is_default_mode = False
+if not keyword.strip() and default_exists:
+    is_default_mode = True
+    keyword = DEFAULT_KEYWORD
+    st.caption(f"默认模式：关键词 {DEFAULT_KEYWORD.replace('|', ' + ')}，数据源 {DEFAULT_EXCEL}")
 
 start_date, end_date = date_range
 if start_date > end_date:
     st.error("时间区间不合法：开始日期不能晚于结束日期。")
     st.stop()
+
+# ── 联网搜索 → LLM意图识别 → 置信度过滤 → 核心实体（两种模式都走）──
+intent_result: Optional[Dict[str, Any]] = None
+if api_key:
+    srch_cfg = search_client.load_search_config()
+    if srch_cfg.get("enabled"):
+        search_query = keyword.replace("|", " ")
+        with st.spinner(f"正在联网搜索「{search_query}」..."):
+            search_results, srch_status = search_client.web_search(
+                search_query, srch_cfg, start_date, end_date,
+            )
+        if srch_status == "ok" and search_results:
+            with st.spinner("正在进行LLM意图识别..."):
+                intent_result, intent_status = recognize_intent(
+                    api_key, base_url, model, search_query, search_results,
+                    start_date, end_date,
+                )
+            if intent_status == "ok" and intent_result:
+                # 置信度过滤核心实体
+                raw_entities = intent_result.get("event_entities", [])
+                if isinstance(raw_entities, list) and raw_entities:
+                    filtered_entities = search_client.filter_entities_by_confidence(
+                        raw_entities, search_results, threshold=0.8
+                    )
+                    if filtered_entities:
+                        keyword = "|".join(filtered_entities)
+                        intent_result["event_entities"] = filtered_entities
+
+                # 存入 session_state 供后续展示
+                st.session_state["intent_result"] = intent_result
+
+# ── 数据获取：默认模式用Excel，非默认模式查DB ──
+db_used = False
+if is_default_mode:
+    # 默认模式：使用默认Excel，视为DB返回的数据，继续走完整管线
+    pass
+else:
+    entities = [k.strip() for k in keyword.split("|") if k.strip()]
+    db_cfg = db_client.load_db_config()
+    if not db_cfg.get("enabled"):
+        st.error("非默认模式需要配置公司数据库。请在 local_settings.py 中填写 DB_HOST、DB_USER、DB_PASSWORD、DB_SERVICE_NAME。")
+        st.info("提示：如需演示，请清空关键词使用默认模式。")
+        st.stop()
+    if not entities:
+        st.error("未能识别出有效核心实体，无法查询数据库。")
+        st.stop()
+    with st.spinner("正在从数据库查询文章数据..."):
+        db_df, db_status = db_client.query_articles(entities, start_date, end_date, db_cfg)
+    if db_status != "ok" or db_df is None or db_df.empty:
+        st.error(f"数据库查询失败：{db_status}。请检查DB配置和网络连接。")
+        st.stop()
+    df = prepare_dataframe(db_df)
+    db_used = True
+    if df["dtime"].notna().any():
+        min_date = df["dtime"].min().date()
+        max_date = df["dtime"].max().date()
+
+# ── 展示意图识别结果 ──
+if st.session_state.get("intent_result"):
+    ir = st.session_state["intent_result"]
+    event_name = ir.get("event_name", "")
+    entities_list = ir.get("event_entities", [])
+    assets = ir.get("Industry_asset", [])
+    key_points = parse_key_points(ir)
+
+    if event_name:
+        st.subheader("事件概况")
+        cols = st.columns([2, 1, 1])
+        with cols[0]:
+            st.markdown(f"**事件名称：** {html.escape(event_name)}")
+        with cols[1]:
+            if isinstance(entities_list, list) and entities_list:
+                st.markdown(f"**核心实体：** {html.escape(', '.join(entities_list))}")
+        with cols[2]:
+            if isinstance(assets, list) and assets:
+                st.markdown(f"**关联标的：** {html.escape(', '.join(assets))}")
+            else:
+                st.markdown("**关联标的：** 未识别")
+
+        if key_points:
+            with st.expander("关键时间节点", expanded=False):
+                for kp in key_points:
+                    st.markdown(f"- {html.escape(kp['time'])} · {html.escape(kp['node_name'])}")
+
+# ── 事件关键节点（优先使用LLM识别结果，用户可覆盖）──
+with st.expander("事件关键节点（可选，可编辑）", expanded=False):
+    default_event_text = ""
+    if st.session_state.get("intent_result"):
+        kps = parse_key_points(st.session_state["intent_result"])
+        default_event_text = "\n".join(
+            f"{kp['time']} | {kp['node_name']}" for kp in kps
+        )
+    event_text = st.text_area(
+        "每行一个：YYYY-MM-DD | 节点名称",
+        value=default_event_text,
+        height=120,
+        key=f"event_nodes|{selected_file}|{sheet_name}",
+    )
 
 filter_signature = hashlib.sha1(
     f"{selected_file}|{sheet_name}|{start_date}|{end_date}|{keyword}".encode("utf-8")
@@ -852,6 +1222,21 @@ if st.session_state.get("filter_signature") != filter_signature:
 
 event_nodes = parse_event_nodes(event_text)
 filtered = filter_dataframe(df, start_date, end_date, keyword)
+
+# Embedding 粗筛 + LLM 精筛（默认/非默认模式都走）
+if not filtered.empty and api_key:
+    keyword_for_filter = keyword.replace("|", " ")
+    embed_cfg = load_embedding_config()
+    if embed_cfg.get("api_key") and len(filtered) > 10:
+        with st.spinner(f"正在进行语义粗筛（Embedding）... 候选 {len(filtered)} 篇"):
+            filtered, embed_meta = embedding_coarse_filter(filtered, keyword_for_filter, embed_cfg)
+        if embed_meta.get("enabled"):
+            st.caption(f"Embedding 粗筛：{embed_meta['input']} → {embed_meta['output']} 篇（阈值 {embed_meta.get('threshold', 0.35)}）")
+    if not filtered.empty and len(filtered) > 1:
+        with st.spinner(f"正在进行LLM精筛... 候选 {len(filtered)} 篇"):
+            filtered, llm_meta = llm_fine_filter(filtered, keyword_for_filter, api_key, base_url, model)
+        if llm_meta.get("enabled"):
+            st.caption(f"LLM 精筛：{llm_meta['input']} → {llm_meta['output']} 篇")
 
 if filtered.empty:
     st.info("当前筛选条件下没有命中文章。")
@@ -923,6 +1308,7 @@ else:
         "summary",
         "content",
         "url",
+        "dtime",
     ]].to_dict(orient="records")
 
     current_vp_key, _ = viewpoint_cache_key(base_url, model, rows)
@@ -944,7 +1330,7 @@ else:
     display_key = st.session_state.get("viewpoint_display_key")
     cache = st.session_state.get("viewpoint_cache", {})
     if display_key == current_vp_key and current_vp_key in cache and isinstance(cache[current_vp_key], list):
-        st.markdown(render_viewpoint_list(cache[current_vp_key]), unsafe_allow_html=True)
+        st.markdown(render_viewpoint_clusters(cache[current_vp_key]), unsafe_allow_html=True)
     elif display_key and display_key != current_vp_key:
         st.info("筛选条件已变化，请重新生成观点总结。")
     else:
