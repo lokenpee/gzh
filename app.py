@@ -421,13 +421,7 @@ def build_timeline_option(
     option: Dict[str, Any] = {
         "tooltip": {
             "trigger": "axis",
-            "formatter": """
-function(params){
-  var p = params && params[0];
-  if (!p) { return ''; }
-  return p.axisValue + '<br/>' + '文章数：' + p.data;
-}
-""".strip(),
+            "formatter": "{b}<br/>文章数：{c}",
         },
         "xAxis": {
             "type": "category",
@@ -654,7 +648,7 @@ def recognize_timeline(
     if not api_key or not search_cfg.get("enabled"):
         return [], "搜索未配置或无API Key"
 
-    timeline_query = f"{event_name} 关键时间节点 事件经过"
+    timeline_query = f"{event_name} 事件始末 重要节点"
     timeline_results, srch_status = search_client.web_search(
         timeline_query, search_cfg, start_date, end_date,
     )
@@ -669,16 +663,23 @@ def recognize_timeline(
         )
 
     prompt = (
-        "你是一名资深金融事件分析师。请根据联网检索结果，提取该事件的关键时间节点。\n\n"
+        "你是一名资深金融事件分析师。请根据联网检索结果，提取该事件从发生到演变的关键时间节点。\n\n"
         "输出必须是合法JSON数组，不要添加Markdown代码块。格式：\n"
         '[{"node_name": "节点描述", "time": "yyyy-MM-dd"}, ...]\n\n'
-        "要求：\n"
-        "- 最多5个关键时间节点，按时间顺序排列\n"
-        "- 每个节点必须与事件有【直接因果或时序关系】\n"
-        "- 如果某件事只是同期发生但与事件无关，不要收录\n"
-        "- 好的示例：'2025-04-02 美国宣布对华加征34%关税'（直接因果）\n"
-        "- 坏的示例：'2025-03-27 某券商发布研报'（仅是评论，非事件节点）\n"
-        "- node_name不超过30字，time格式必须为yyyy-MM-dd\n\n"
+        "核心纪律——每个节点都必须通过以下三问检验：\n"
+        "1. 这个节点是否直接改变了事件的走向？\n"
+        "2. 去掉这个节点，事件时间线是否会出现空白？\n"
+        "3. 这个节点是事件本身的里程碑，还是同期发生的无关事件？\n\n"
+        "收录规则：\n"
+        "- 必须包含事件的【起点】（如协议签署、政策宣布、冲突爆发的日期）\n"
+        "- 必须包含事件的【关键转折】（如升级、反制、谈判破裂等改变走向的节点）\n"
+        "- 最多5个节点，按时间升序排列\n"
+        "- node_name格式：'主体 + 动作 + 后果/影响'，不超过30字\n"
+        "- time格式必须为yyyy-MM-dd\n\n"
+        "排除规则：\n"
+        "- 券商/机构的研报、分析、评论（不论是否提及事件）——这些是观察者，不是事件参与者\n"
+        "- 与事件同期发生但无直接因果的事件（如'同一时期某国大选''同期发布的经济数据'）\n"
+        "- 事件发生后的总结、回顾、周年纪念\n\n"
         f"事件名称：{event_name}\n"
         f"核心实体：{', '.join(entities)}\n"
         f"时间区间：{start_date.isoformat()} ~ {end_date.isoformat()}\n\n"
@@ -1370,37 +1371,36 @@ if st.session_state.get("intent_result"):
 
     if event_name:
         st.subheader("事件概况")
-        cols = st.columns([2, 1, 1])
+        # 第一行：事件名称（通栏）
+        st.markdown(f"**事件名称：** {html.escape(event_name)}")
+        # 第二行：核心实体 | 关联标的
+        cols = st.columns([1, 1])
         with cols[0]:
-            st.markdown(f"**事件名称：** {html.escape(event_name)}")
-        with cols[1]:
             if isinstance(entities_list, list) and entities_list:
                 st.markdown(f"**核心实体：** {html.escape(', '.join(entities_list))}")
-        with cols[2]:
+            else:
+                st.markdown("**核心实体：** 未识别")
+        with cols[1]:
             if isinstance(assets, list) and assets:
                 st.markdown(f"**关联标的：** {html.escape(', '.join(assets))}")
             else:
                 st.markdown("**关联标的：** 未识别")
-
+        # 第三行：关键节点
         if key_points:
-            with st.expander("关键时间节点", expanded=False):
-                for kp in key_points:
-                    st.markdown(f"- {html.escape(kp['time'])} · {html.escape(kp['node_name'])}")
+            kp_lines = "  \n".join(
+                f"- {html.escape(kp['time'])}  {html.escape(kp['node_name'])}"
+                for kp in key_points
+            )
+            st.markdown(f"**关键节点：**  \n{kp_lines}")
+        else:
+            st.markdown("**关键节点：** 未识别")
 
-# ── 事件关键节点（优先使用LLM识别结果，用户可覆盖）──
-with st.expander("事件关键节点（可选，可编辑）", expanded=False):
-    default_event_text = ""
-    if st.session_state.get("intent_result"):
-        kps = parse_key_points(st.session_state["intent_result"])
-        default_event_text = "\n".join(
-            f"{kp['time']} | {kp['node_name']}" for kp in kps
-        )
-    event_text = st.text_area(
-        "每行一个：YYYY-MM-DD | 节点名称",
-        value=default_event_text,
-        height=120,
-        key="event_nodes",
-    )
+# ── 事件关键节点（LLM自动生成，可直接用于图表标注）──
+event_nodes: List[Dict[str, str]] = []
+if st.session_state.get("intent_result"):
+    kps = parse_key_points(st.session_state["intent_result"])
+    for kp in kps:
+        event_nodes.append({"date": kp["time"], "label": kp["node_name"]})
 
 filter_signature = hashlib.sha1(
     f"{selected_file}|{sheet_name}|{start_date}|{end_date}|{keyword}".encode("utf-8")
@@ -1409,10 +1409,8 @@ if st.session_state.get("filter_signature") != filter_signature:
     st.session_state["filter_signature"] = filter_signature
     st.session_state["selected_day"] = None
     st.session_state["daily_expanded"] = False
-    st.session_state["wall_limit"] = 20
     st.session_state["viewpoint_display_key"] = None
 
-event_nodes = parse_event_nodes(event_text)
 
 # ── 初筛：日期范围 + 状态过滤 ──
 filtered = filter_dataframe(df, start_date, end_date, "")
@@ -1437,16 +1435,21 @@ if intent_entities and not filtered.empty:
 
 # ── Embedding 粗筛 + LLM 精筛（默认/非默认模式都走）──
 if not filtered.empty and api_key:
-    keyword_for_filter = keyword.replace("|", " ")
+    # 优先使用LLM识别的规范化事件名作为Embedding Query
+    emb_query = keyword.replace("|", " ")
+    if st.session_state.get("intent_result"):
+        event_name = st.session_state["intent_result"].get("event_name", "")
+        if event_name:
+            emb_query = event_name
     embed_cfg = load_embedding_config()
     if embed_cfg.get("api_key") and len(filtered) > 10:
         with st.spinner(f"正在进行语义粗筛（Embedding）... 候选 {len(filtered)} 篇"):
-            filtered, embed_meta = embedding_coarse_filter(filtered, keyword_for_filter, embed_cfg)
+            filtered, embed_meta = embedding_coarse_filter(filtered, emb_query, embed_cfg)
         if embed_meta.get("enabled"):
             st.caption(f"Embedding 粗筛：{embed_meta['input']} → {embed_meta['output']} 篇（阈值 {embed_meta.get('threshold', 0.35)}）")
     if not filtered.empty and len(filtered) > 1:
         with st.spinner(f"正在进行LLM精筛... 候选 {len(filtered)} 篇"):
-            filtered, llm_meta = llm_fine_filter(filtered, keyword_for_filter, api_key, base_url, model)
+            filtered, llm_meta = llm_fine_filter(filtered, emb_query, api_key, base_url, model)
         if llm_meta.get("enabled"):
             st.caption(f"LLM 精筛：{llm_meta['input']} → {llm_meta['output']} 篇")
 
@@ -1494,6 +1497,7 @@ clicked = st_echarts(
     height="350px",
     key="timeline",
 )
+st.caption("💡 点击数据点查看当日文章列表")
 
 clicked_day = extract_clicked_date(clicked)
 if clicked_day:
@@ -1568,23 +1572,15 @@ else:
     else:
         st.caption("点击上方按钮后，将在此处展示Top10观点列表。")
 
-st.subheader("热点文章（阅读量Top100）")
-wall = filtered.sort_values("read_count", ascending=False).head(100)
+st.subheader("热点文章（阅读量Top3）")
+wall = filtered.sort_values("read_count", ascending=False).head(3)
 if wall.empty:
     st.info("当前筛选条件下没有可展示的文章。")
 else:
-    wall_limit = int(st.session_state.get("wall_limit", 20))
-    wall_limit = max(1, min(wall_limit, len(wall)))
-    wall_show = wall.head(wall_limit)
-
-    cols = st.columns(3)
-    for idx, (_, row) in enumerate(wall_show.iterrows()):
+    cols = st.columns(min(3, len(wall)))
+    for idx, (_, row) in enumerate(wall.iterrows()):
         with cols[idx % 3]:
             st.markdown(render_wall_card(row), unsafe_allow_html=True)
-
-    if wall_limit < len(wall):
-        if st.button("加载更多"):
-            st.session_state["wall_limit"] = min(wall_limit + 20, len(wall))
 
 st.subheader("关联标的走势")
 
