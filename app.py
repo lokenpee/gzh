@@ -413,22 +413,39 @@ def build_timeline_option(
     days: List[str],
     counts: List[int],
     event_nodes: List[Dict[str, str]],
+    day_articles_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     mark_lines = [
         {"xAxis": node["date"], "name": f"{node['label']}\n{node['date'][5:]}"}
         for node in event_nodes
     ]
+    if day_articles_map is None:
+        day_articles_map = {}
+
+    series_data = []
+    for d, c in zip(days, counts):
+        series_data.append({"value": c, "articles": day_articles_map.get(d, "")})
+
+    tooltip_formatter = (
+        "function(params){"
+        "var p=params[0];"
+        "if(!p)return'';"
+        "var h=p.axisValue+'<br/>文章数：'+p.value;"
+        "if(p.data&&p.data.articles&&p.data.articles.length>0)"
+        "h+='<br/>'+p.data.articles;"
+        "return h;"
+        "}"
+    )
     option: Dict[str, Any] = {
         "tooltip": {
             "trigger": "axis",
-            "formatter": "{b}<br/>文章数：{c}",
+            "formatter": tooltip_formatter,
         },
         "xAxis": {
             "type": "category",
             "data": days,
             "axisLabel": {
                 "rotate": 45,
-                "formatter": "function(value){return String(value).slice(5);}",
             },
         },
         "yAxis": {"type": "value", "min": 0},
@@ -439,7 +456,7 @@ def build_timeline_option(
                 "name": "文章数",
                 "type": "line",
                 "smooth": True,
-                "data": counts,
+                "data": series_data,
                 "itemStyle": {"color": "#3b82f6"},
                 "areaStyle": {
                     "color": {
@@ -456,7 +473,6 @@ def build_timeline_option(
                 },
                 "label": {
                     "show": True,
-                    "formatter": "function(params){return params.data>0?params.data:'';}"
                 },
                 "markLine": {
                     "symbol": ["none", "none"],
@@ -648,7 +664,8 @@ def recognize_timeline(
     if not api_key or not search_cfg.get("enabled"):
         return [], "搜索未配置或无API Key"
 
-    timeline_query = f"{event_name} 事件始末 重要节点"
+    # 搜索查询包含时间范围，确保结果聚焦于区间内
+    timeline_query = f"{event_name} {start_date.strftime('%Y年%m月')} {end_date.strftime('%Y年%m月')} 关键节点"
     timeline_results, srch_status = search_client.web_search(
         timeline_query, search_cfg, start_date, end_date,
     )
@@ -662,27 +679,31 @@ def recognize_timeline(
             f"内容片段：{str(item.get('content',''))[:800]}"
         )
 
+    # 解析用户提供的时间区间边界
+    s_str = start_date.isoformat()
+    e_str = end_date.isoformat()
+
     prompt = (
-        "你是一名资深金融事件分析师。请根据联网检索结果，提取该事件从发生到演变的关键时间节点。\n\n"
+        "你是一名资深金融事件分析师。请根据联网检索结果，提取该事件在指定时间区间内的关键时间节点。\n\n"
         "输出必须是合法JSON数组，不要添加Markdown代码块。格式：\n"
         '[{"node_name": "节点描述", "time": "yyyy-MM-dd"}, ...]\n\n'
-        "核心纪律——每个节点都必须通过以下三问检验：\n"
-        "1. 这个节点是否直接改变了事件的走向？\n"
-        "2. 去掉这个节点，事件时间线是否会出现空白？\n"
-        "3. 这个节点是事件本身的里程碑，还是同期发生的无关事件？\n\n"
+        f"★★★ 硬性约束 ★★★\n"
+        f"每个节点的 time 必须严格在 {s_str} ~ {e_str} 范围内！\n"
+        f"禁止输出早于 {s_str} 或晚于 {e_str} 的日期。\n"
+        f"如果某个节点日期超出此范围，不要收录。\n\n"
         "收录规则：\n"
-        "- 必须包含事件的【起点】（如协议签署、政策宣布、冲突爆发的日期）\n"
-        "- 必须包含事件的【关键转折】（如升级、反制、谈判破裂等改变走向的节点）\n"
-        "- 最多5个节点，按时间升序排列\n"
-        "- node_name格式：'主体 + 动作 + 后果/影响'，不超过30字\n"
+        "- 必须是事件本身的里程碑节点（宣布/签署/生效/升级/反制/转折）\n"
+        "- 按时间升序排列，最多5个\n"
+        "- node_name格式：'主体 + 动作'，不超过30字\n"
         "- time格式必须为yyyy-MM-dd\n\n"
-        "排除规则：\n"
-        "- 券商/机构的研报、分析、评论（不论是否提及事件）——这些是观察者，不是事件参与者\n"
-        "- 与事件同期发生但无直接因果的事件（如'同一时期某国大选''同期发布的经济数据'）\n"
-        "- 事件发生后的总结、回顾、周年纪念\n\n"
+        "排除规则（严禁收录）：\n"
+        "- 券商/机构的研报、分析、评论——这是观察者视角，不是事件节点\n"
+        "- 经济数据发布（CPI/GDP/PMI等）——这是结果/影响，不是事件节点\n"
+        "- 市场反应描述（'股市下跌''避险情绪升温'）——这是市场反应，不是事件节点\n"
+        "- 与事件无直接因果的同期事件\n\n"
         f"事件名称：{event_name}\n"
         f"核心实体：{', '.join(entities)}\n"
-        f"时间区间：{start_date.isoformat()} ~ {end_date.isoformat()}\n\n"
+        f"允许时间范围：{s_str} ~ {e_str}\n\n"
         f"联网检索结果（共{len(timeline_results)}条）：\n\n"
         + "\n\n".join(items)
     )
@@ -705,8 +726,16 @@ def recognize_timeline(
             node_name = str(item.get("node_name") or item.get("label") or "").strip()
             time_raw = item.get("time") or item.get("date") or ""
             time_str = str(time_raw).strip()
-            if node_name and time_str:
-                key_points.append({"node_name": node_name, "time": time_str})
+            if not node_name or not time_str:
+                continue
+            # 后置校验：过滤区间外的日期
+            try:
+                kp_date = pd.to_datetime(time_str).date()
+                if kp_date < start_date or kp_date > end_date:
+                    continue
+            except Exception:
+                continue
+            key_points.append({"node_name": node_name, "time": time_str})
         return key_points[:5], "ok"
     except json.JSONDecodeError:
         return [], f"JSON解析失败：{content[:300]}"
@@ -1251,17 +1280,24 @@ with top_right:
 # ── 开始复盘按钮 ──
 restore_from_hist = st.session_state.get("restore_from_history", False)
 search_triggered = st.session_state.get("search_triggered", False)
+test_timeline = st.session_state.get("test_timeline", False)
 
-if not search_triggered and not restore_from_hist:
-    _, btn_col, _ = st.columns([1, 2, 1])
+if not search_triggered and not restore_from_hist and not test_timeline:
+    _, btn_col, btn_col2, _ = st.columns([1, 1, 1, 1])
     with btn_col:
         if st.button("开始复盘", type="primary", use_container_width=True):
+            st.session_state["test_timeline"] = False
             st.session_state["search_triggered"] = True
+            st.rerun()
+    with btn_col2:
+        if st.button("测试时间轴", use_container_width=True):
+            st.session_state["test_timeline"] = True
             st.rerun()
     st.info("请输入事件关键词和时间区间，点击「开始复盘」进行分析。")
     st.stop()
 
-st.session_state["search_triggered"] = True
+if not test_timeline:
+    st.session_state["search_triggered"] = True
 st.session_state.pop("restore_from_history", None)
 
 start_date, end_date = date_range
@@ -1269,189 +1305,200 @@ if start_date > end_date:
     st.error("时间区间不合法：开始日期不能晚于结束日期。")
     st.stop()
 
-# ── 默认模式（关键词为空时使用预设关键词）──
-is_default_mode = False
-if not keyword.strip() and default_exists:
-    is_default_mode = True
-    keyword = DEFAULT_KEYWORD
-    st.caption(f"关键词 {DEFAULT_KEYWORD.replace('|', ' + ')}")
+# ── 测试时间轴模式：跳过所有LLM/联网/精筛，直接用Excel数据展示 ──
+if test_timeline:
+    st.caption("测试模式：直接展示Excel数据，未经过联网/LLM/Emb/精筛")
+    event_nodes = []
+    filtered = filter_dataframe(df, start_date, end_date, "")
+    filter_signature = hashlib.sha1(
+        f"{selected_file}|{sheet_name}|{start_date}|{end_date}|test".encode("utf-8")
+    ).hexdigest()
 
-# ── 联网搜索 → LLM意图识别 → 置信度过滤 → 核心实体（两种模式都走）──
-intent_result: Optional[Dict[str, Any]] = None
-event_key_points: List[Dict[str, str]] = []
-if not api_key:
-    st.warning("未配置 LLM API Key，跳过联网搜索与意图识别。请在 local_settings.py 中设置 DEEPSEEK_API_KEY。")
-else:
-    srch_cfg = search_client.load_search_config()
-    if not srch_cfg.get("enabled"):
-        st.warning("未配置搜索服务，跳过联网搜索。请在 local_settings.py 中设置 SEARCH_PROVIDER 和 SEARCH_API_KEY。")
+if not test_timeline:
+
+    # ── 默认模式（关键词为空时使用预设关键词）──
+    is_default_mode = False
+    if not keyword.strip() and default_exists:
+        is_default_mode = True
+        keyword = DEFAULT_KEYWORD
+        st.caption(f"关键词 {DEFAULT_KEYWORD.replace('|', ' + ')}")
+
+    # ── 联网搜索 → LLM意图识别 → 置信度过滤 → 核心实体（两种模式都走）──
+    intent_result: Optional[Dict[str, Any]] = None
+    event_key_points: List[Dict[str, str]] = []
+    if not api_key:
+        st.warning("未配置 LLM API Key，跳过联网搜索与意图识别。请在 local_settings.py 中设置 DEEPSEEK_API_KEY。")
     else:
-        search_query = keyword.replace("|", " ")
-        with st.spinner(f"正在联网搜索「{search_query}」..."):
-            search_results, srch_status = search_client.web_search(
-                search_query, srch_cfg, start_date, end_date,
-            )
-        if srch_status != "ok":
-            st.warning(f"联网搜索失败：{srch_status}")
-        elif not search_results:
-            st.warning(f"联网搜索「{search_query}」未返回结果，请尝试调整关键词或时间区间。")
+        srch_cfg = search_client.load_search_config()
+        if not srch_cfg.get("enabled"):
+            st.warning("未配置搜索服务，跳过联网搜索。请在 local_settings.py 中设置 SEARCH_PROVIDER 和 SEARCH_API_KEY。")
         else:
-            st.caption(f"联网搜索返回 {len(search_results)} 条结果")
-            with st.spinner("正在进行LLM意图识别（事件理解）..."):
-                intent_result, intent_status = recognize_intent(
-                    api_key, base_url, model, search_query, search_results,
-                    start_date, end_date,
+            search_query = keyword.replace("|", " ")
+            with st.spinner(f"正在联网搜索「{search_query}」..."):
+                search_results, srch_status = search_client.web_search(
+                    search_query, srch_cfg, start_date, end_date,
                 )
-            if intent_status != "ok":
-                st.warning(f"LLM意图识别失败：{intent_status}")
-            elif not intent_result:
-                st.warning("LLM意图识别未返回有效结果。")
+            if srch_status != "ok":
+                st.warning(f"联网搜索失败：{srch_status}")
+            elif not search_results:
+                st.warning(f"联网搜索「{search_query}」未返回结果，请尝试调整关键词或时间区间。")
             else:
-                # 置信度过滤核心实体
-                raw_entities = intent_result.get("event_entities", [])
-                if isinstance(raw_entities, list) and raw_entities:
-                    filtered_entities = search_client.filter_entities_by_confidence(
-                        raw_entities, search_results, threshold=0.8
+                st.caption(f"联网搜索返回 {len(search_results)} 条结果")
+                with st.spinner("正在进行LLM意图识别（事件理解）..."):
+                    intent_result, intent_status = recognize_intent(
+                        api_key, base_url, model, search_query, search_results,
+                        start_date, end_date,
                     )
-                    if filtered_entities:
-                        keyword = "|".join(filtered_entities)
-                        intent_result["event_entities"] = filtered_entities
-
-                # 存入 session_state 供后续展示
-                st.session_state["intent_result"] = intent_result
-
-                # ── 第二阶段：时间线搜索 → LLM提取关键节点 ──
-                event_name = intent_result.get("event_name", "")
-                final_entities = intent_result.get("event_entities", [])
-                if event_name:
-                    with st.spinner(f"正在联网搜索「{event_name}」关键时间节点..."):
-                        event_key_points, tl_status = recognize_timeline(
-                            event_name, final_entities,
-                            start_date, end_date,
-                            srch_cfg, api_key, base_url, model,
+                if intent_status != "ok":
+                    st.warning(f"LLM意图识别失败：{intent_status}")
+                elif not intent_result:
+                    st.warning("LLM意图识别未返回有效结果。")
+                else:
+                    # 置信度过滤核心实体
+                    raw_entities = intent_result.get("event_entities", [])
+                    if isinstance(raw_entities, list) and raw_entities:
+                        filtered_entities = search_client.filter_entities_by_confidence(
+                            raw_entities, search_results, threshold=0.8
                         )
-                    if tl_status != "ok":
-                        st.warning(f"时间线搜索失败：{tl_status}")
-                    elif event_key_points:
-                        intent_result["key_points"] = event_key_points
-                        st.session_state["intent_result"] = intent_result
+                        if filtered_entities:
+                            keyword = "|".join(filtered_entities)
+                            intent_result["event_entities"] = filtered_entities
 
-# ── 数据获取：默认模式用Excel，非默认模式查DB ──
-db_used = False
-if is_default_mode:
-    # 默认模式：使用默认Excel，视为DB返回的数据，继续走完整管线
-    pass
-else:
-    entities = [k.strip() for k in keyword.split("|") if k.strip()]
-    db_cfg = db_client.load_db_config()
-    if not db_cfg.get("enabled"):
-        st.error("非默认模式需要配置公司数据库。请在 local_settings.py 中填写 DB_HOST、DB_USER、DB_PASSWORD、DB_SERVICE_NAME。")
-        st.stop()
-    if not entities:
-        st.error("未能识别出有效核心实体，无法查询数据库。")
-        st.stop()
-    with st.spinner("正在从数据库查询文章数据..."):
-        db_df, db_status = db_client.query_articles(entities, start_date, end_date, db_cfg)
-    if db_status != "ok" or db_df is None or db_df.empty:
-        st.error(f"数据库查询失败：{db_status}。请检查DB配置和网络连接。")
-        st.stop()
-    df = prepare_dataframe(db_df)
-    db_used = True
-    if df["dtime"].notna().any():
-        min_date = df["dtime"].min().date()
-        max_date = df["dtime"].max().date()
+                    # 存入 session_state 供后续展示
+                    st.session_state["intent_result"] = intent_result
 
-# ── 展示意图识别结果 ──
-if st.session_state.get("intent_result"):
-    ir = st.session_state["intent_result"]
-    event_name = ir.get("event_name", "")
-    entities_list = ir.get("event_entities", [])
-    assets = ir.get("Industry_asset", [])
-    key_points = parse_key_points(ir)
+                    # ── 第二阶段：时间线搜索 → LLM提取关键节点 ──
+                    event_name = intent_result.get("event_name", "")
+                    final_entities = intent_result.get("event_entities", [])
+                    if event_name:
+                        with st.spinner(f"正在联网搜索「{event_name}」关键时间节点..."):
+                            event_key_points, tl_status = recognize_timeline(
+                                event_name, final_entities,
+                                start_date, end_date,
+                                srch_cfg, api_key, base_url, model,
+                            )
+                        if tl_status != "ok":
+                            st.warning(f"时间线搜索失败：{tl_status}")
+                        elif event_key_points:
+                            intent_result["key_points"] = event_key_points
+                            st.session_state["intent_result"] = intent_result
 
-    if event_name:
-        st.subheader("事件概况")
-        # 第一行：事件名称（通栏）
-        st.markdown(f"**事件名称：** {html.escape(event_name)}")
-        # 第二行：核心实体 | 关联标的
-        cols = st.columns([1, 1])
-        with cols[0]:
-            if isinstance(entities_list, list) and entities_list:
-                st.markdown(f"**核心实体：** {html.escape(', '.join(entities_list))}")
-            else:
-                st.markdown("**核心实体：** 未识别")
-        with cols[1]:
-            if isinstance(assets, list) and assets:
-                st.markdown(f"**关联标的：** {html.escape(', '.join(assets))}")
-            else:
-                st.markdown("**关联标的：** 未识别")
-        # 第三行：关键节点
-        if key_points:
-            kp_lines = "  \n".join(
-                f"- {html.escape(kp['time'])}  {html.escape(kp['node_name'])}"
-                for kp in key_points
-            )
-            st.markdown(f"**关键节点：**  \n{kp_lines}")
-        else:
-            st.markdown("**关键节点：** 未识别")
+    # ── 数据获取：默认模式用Excel，非默认模式查DB ──
+    db_used = False
+    if is_default_mode:
+        # 默认模式：使用默认Excel，视为DB返回的数据，继续走完整管线
+        pass
+    else:
+        entities = [k.strip() for k in keyword.split("|") if k.strip()]
+        db_cfg = db_client.load_db_config()
+        if not db_cfg.get("enabled"):
+            st.error("非默认模式需要配置公司数据库。请在 local_settings.py 中填写 DB_HOST、DB_USER、DB_PASSWORD、DB_SERVICE_NAME。")
+            st.stop()
+        if not entities:
+            st.error("未能识别出有效核心实体，无法查询数据库。")
+            st.stop()
+        with st.spinner("正在从数据库查询文章数据..."):
+            db_df, db_status = db_client.query_articles(entities, start_date, end_date, db_cfg)
+        if db_status != "ok" or db_df is None or db_df.empty:
+            st.error(f"数据库查询失败：{db_status}。请检查DB配置和网络连接。")
+            st.stop()
+        df = prepare_dataframe(db_df)
+        db_used = True
+        if df["dtime"].notna().any():
+            min_date = df["dtime"].min().date()
+            max_date = df["dtime"].max().date()
 
-# ── 事件关键节点（LLM自动生成，可直接用于图表标注）──
-event_nodes: List[Dict[str, str]] = []
-if st.session_state.get("intent_result"):
-    kps = parse_key_points(st.session_state["intent_result"])
-    for kp in kps:
-        event_nodes.append({"date": kp["time"], "label": kp["node_name"]})
-
-filter_signature = hashlib.sha1(
-    f"{selected_file}|{sheet_name}|{start_date}|{end_date}|{keyword}".encode("utf-8")
-).hexdigest()
-if st.session_state.get("filter_signature") != filter_signature:
-    st.session_state["filter_signature"] = filter_signature
-    st.session_state["selected_day"] = None
-    st.session_state["daily_expanded"] = False
-    st.session_state["viewpoint_display_key"] = None
-
-
-# ── 初筛：日期范围 + 状态过滤 ──
-filtered = filter_dataframe(df, start_date, end_date, "")
-
-# ── 核心实体 AND 匹配（正文content必须包含全部核心实体词）──
-intent_entities: List[str] = []
-if st.session_state.get("intent_result"):
-    raw_ents = st.session_state["intent_result"].get("event_entities", [])
-    if isinstance(raw_ents, list) and raw_ents:
-        intent_entities = [str(e).strip() for e in raw_ents if str(e).strip()]
-
-if not intent_entities:
-    # 降级：使用关键词拆分作为实体词
-    intent_entities = [k.strip() for k in keyword.split("|") if k.strip()]
-
-if intent_entities and not filtered.empty:
-    before_entity_filter = len(filtered)
-    filtered = filter_by_entities(filtered, intent_entities)
-    dropped = before_entity_filter - len(filtered)
-    if dropped > 0:
-        st.caption(f"实体AND初筛：{before_entity_filter} → {len(filtered)} 篇（要求正文包含：{', '.join(intent_entities)}）")
-
-# ── Embedding 粗筛 + LLM 精筛（默认/非默认模式都走）──
-if not filtered.empty and api_key:
-    # 优先使用LLM识别的规范化事件名作为Embedding Query
-    emb_query = keyword.replace("|", " ")
+    # ── 展示意图识别结果 ──
     if st.session_state.get("intent_result"):
-        event_name = st.session_state["intent_result"].get("event_name", "")
+        ir = st.session_state["intent_result"]
+        event_name = ir.get("event_name", "")
+        entities_list = ir.get("event_entities", [])
+        assets = ir.get("Industry_asset", [])
+        key_points = parse_key_points(ir)
+
         if event_name:
-            emb_query = event_name
-    embed_cfg = load_embedding_config()
-    if embed_cfg.get("api_key") and len(filtered) > 10:
-        with st.spinner(f"正在进行语义粗筛（Embedding）... 候选 {len(filtered)} 篇"):
-            filtered, embed_meta = embedding_coarse_filter(filtered, emb_query, embed_cfg)
-        if embed_meta.get("enabled"):
-            st.caption(f"Embedding 粗筛：{embed_meta['input']} → {embed_meta['output']} 篇（阈值 {embed_meta.get('threshold', 0.35)}）")
-    if not filtered.empty and len(filtered) > 1:
-        with st.spinner(f"正在进行LLM精筛... 候选 {len(filtered)} 篇"):
-            filtered, llm_meta = llm_fine_filter(filtered, emb_query, api_key, base_url, model)
-        if llm_meta.get("enabled"):
-            st.caption(f"LLM 精筛：{llm_meta['input']} → {llm_meta['output']} 篇")
+            st.subheader("事件概况")
+            # 第一行：事件名称（通栏）
+            st.markdown(f"**事件名称：** {html.escape(event_name)}")
+            # 第二行：核心实体 | 关联标的
+            cols = st.columns([1, 1])
+            with cols[0]:
+                if isinstance(entities_list, list) and entities_list:
+                    st.markdown(f"**核心实体：** {html.escape(', '.join(entities_list))}")
+                else:
+                    st.markdown("**核心实体：** 未识别")
+            with cols[1]:
+                if isinstance(assets, list) and assets:
+                    st.markdown(f"**关联标的：** {html.escape(', '.join(assets))}")
+                else:
+                    st.markdown("**关联标的：** 未识别")
+            # 第三行：关键节点
+            if key_points:
+                kp_lines = "  \n".join(
+                    f"- {html.escape(kp['time'])}  {html.escape(kp['node_name'])}"
+                    for kp in key_points
+                )
+                st.markdown(f"**关键节点：**  \n{kp_lines}")
+            else:
+                st.markdown("**关键节点：** 未识别")
+
+    # ── 事件关键节点（LLM自动生成，可直接用于图表标注）──
+    event_nodes: List[Dict[str, str]] = []
+    if st.session_state.get("intent_result"):
+        kps = parse_key_points(st.session_state["intent_result"])
+        for kp in kps:
+            event_nodes.append({"date": kp["time"], "label": kp["node_name"]})
+
+    filter_signature = hashlib.sha1(
+        f"{selected_file}|{sheet_name}|{start_date}|{end_date}|{keyword}".encode("utf-8")
+    ).hexdigest()
+    if st.session_state.get("filter_signature") != filter_signature:
+        st.session_state["filter_signature"] = filter_signature
+        st.session_state["selected_day"] = None
+        st.session_state["daily_expanded"] = False
+        st.session_state["viewpoint_display_key"] = None
+
+
+    # ── 初筛：日期范围 + 状态过滤 ──
+    filtered = filter_dataframe(df, start_date, end_date, "")
+
+    # ── 核心实体 AND 匹配（正文content必须包含全部核心实体词）──
+    intent_entities: List[str] = []
+    if st.session_state.get("intent_result"):
+        raw_ents = st.session_state["intent_result"].get("event_entities", [])
+        if isinstance(raw_ents, list) and raw_ents:
+            intent_entities = [str(e).strip() for e in raw_ents if str(e).strip()]
+
+    if not intent_entities:
+        # 降级：使用关键词拆分作为实体词
+        intent_entities = [k.strip() for k in keyword.split("|") if k.strip()]
+
+    if intent_entities and not filtered.empty:
+        before_entity_filter = len(filtered)
+        filtered = filter_by_entities(filtered, intent_entities)
+        dropped = before_entity_filter - len(filtered)
+        if dropped > 0:
+            st.caption(f"实体AND初筛：{before_entity_filter} → {len(filtered)} 篇（要求正文包含：{', '.join(intent_entities)}）")
+
+    # ── Embedding 粗筛 + LLM 精筛（默认/非默认模式都走）──
+    if not filtered.empty and api_key:
+        # 优先使用LLM识别的规范化事件名作为Embedding Query
+        emb_query = keyword.replace("|", " ")
+        if st.session_state.get("intent_result"):
+            event_name = st.session_state["intent_result"].get("event_name", "")
+            if event_name:
+                emb_query = event_name
+        embed_cfg = load_embedding_config()
+        if embed_cfg.get("api_key") and len(filtered) > 10:
+            with st.spinner(f"正在进行语义粗筛（Embedding）... 候选 {len(filtered)} 篇"):
+                filtered, embed_meta = embedding_coarse_filter(filtered, emb_query, embed_cfg)
+            if embed_meta.get("enabled"):
+                st.caption(f"Embedding 粗筛：{embed_meta['input']} → {embed_meta['output']} 篇（阈值 {embed_meta.get('threshold', 0.35)}）")
+        if not filtered.empty and len(filtered) > 1:
+            with st.spinner(f"正在进行LLM精筛... 候选 {len(filtered)} 篇"):
+                filtered, llm_meta = llm_fine_filter(filtered, emb_query, api_key, base_url, model)
+            if llm_meta.get("enabled"):
+                st.caption(f"LLM 精筛：{llm_meta['input']} → {llm_meta['output']} 篇")
 
 # ── 保存搜索历史 ──
 now = time.time()
@@ -1488,7 +1535,29 @@ days = [d.strftime("%Y-%m-%d") for d in full_days]
 counts = [int(by_day_series.get(d.date(), 0)) for d in full_days]
 count_by_day_str = dict(zip(days, counts))
 
-timeline_option = build_timeline_option(days, counts, event_nodes)
+# 构建每日文章列表（用于tooltip悬浮展示）
+day_articles_map: Dict[str, str] = {}
+for d in full_days:
+    day_df = filtered[filtered["pub_day"] == d.date()]
+    if day_df.empty:
+        continue
+    top = day_df.sort_values("read_count", ascending=False).head(5)
+    lines = []
+    for _, r in top.iterrows():
+        title = str(r.get("title", "") or "")[:40]
+        author = str(r.get("author", "") or "")
+        rc = format_read_count(r.get("read_count", 0))
+        tm = format_time_hhmm(r.get("dtime"))
+        parts = [title]
+        if author:
+            parts.append(author)
+        parts.append(f"{rc}阅读")
+        if tm:
+            parts.append(tm)
+        lines.append(" · ".join(parts))
+    day_articles_map[d.strftime("%Y-%m-%d")] = "<br/>".join(lines)
+
+timeline_option = build_timeline_option(days, counts, event_nodes, day_articles_map)
 
 events = {"click": "function(params){return params.name;}"}
 clicked = st_echarts(
